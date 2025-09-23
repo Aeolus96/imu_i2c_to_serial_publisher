@@ -3,13 +3,17 @@
 
 #include <Arduino.h>
 #include "IMUInterface.h"
-// #include "LSM6DSOX_IMU.h"
-#include "BNO085_IMU.h" // New include for BNO085 support
 #include "IMUMessageFormatter.h"
 
-// Instance of the IMU sensor - comment/uncomment to switch
+// SELECT THE IMU SENSOR BY INCLUDING THE APPROPRIATE HEADER AND INSTANTIATING IT:
+// #include "LSM6DSOX_IMU.h"
 // LSM6DSOX_IMU activeImuSensor;
-BNO085_IMU activeImuSensor; // Example: Switch to BNO085
+
+// #include "BNO085_IMU.h"
+// BNO085_IMU activeImuSensor;
+
+#include "GroveBMI088_IMU.h"
+GroveBMI088_IMU activeImuSensor;
 
 // Reference to active IMU (interface for modularity)
 IMUInterface &imu = activeImuSensor;
