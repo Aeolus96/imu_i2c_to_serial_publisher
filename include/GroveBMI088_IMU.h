@@ -17,6 +17,8 @@ public:
                         latestAccelerometerX(0.0f), latestAccelerometerY(0.0f), latestAccelerometerZ(0.0f),
                         latestGyroscopeX(0.0f), latestGyroscopeY(0.0f), latestGyroscopeZ(0.0f),
                         latestTemperature(0.0f), latestTimestampMilliseconds(0),
+                        offsetAccelX(0.0f), offsetAccelY(0.0f), offsetAccelZ(0.0f),
+                        offsetGyroX(0.0f), offsetGyroY(0.0f), offsetGyroZ(0.0f),
                         sampleCount(0)
     {
         resetCovarianceAccumulators();
@@ -30,6 +32,17 @@ public:
         // Init BMI088 (handles both accel and gyro internally)
         bmi088.initialize();
 
+        // Configure range (wider for less sensitivity; adjust based on application)
+        bmi088.setAccScaleRange(RANGE_24G);  // ±24g for accel
+        bmi088.setGyroScaleRange(RANGE_500); // ±500 dps for gyro
+
+        // Configure ODR (output data rate) for onboard low-pass filtering
+        bmi088.setAccOutputDataRate(ODR_100);        // 100 Hz ODR with ~40 Hz bandwidth
+        bmi088.setGyroOutputDataRate(ODR_100_BW_12); // 100 Hz ODR with 12 Hz bandwidth
+
+        // Perform calibration (average offsets over 100 samples while still)
+        calibrateOffsets();
+
         // Check connection
         return bmi088.isConnection();
     }
@@ -39,23 +52,33 @@ public:
         // Read accel (in m/s²)
         float ax, ay, az;
         bmi088.getAcceleration(&ax, &ay, &az);
-        latestAccelerometerX = ax;
-        latestAccelerometerY = ay;
-        latestAccelerometerZ = az;
+        ax -= offsetAccelX;
+        ay -= offsetAccelY;
+        az -= offsetAccelZ;
+
+        // Apply software low-pass filter (exponential moving average, alpha=0.8 for smoothing)
+        latestAccelerometerX = lowPassFilter(latestAccelerometerX, ax, 0.8f);
+        latestAccelerometerY = lowPassFilter(latestAccelerometerY, ay, 0.8f);
+        latestAccelerometerZ = lowPassFilter(latestAccelerometerZ, az, 0.8f);
 
         // Read gyro (in rad/s)
         float gx, gy, gz;
         bmi088.getGyroscope(&gx, &gy, &gz);
-        latestGyroscopeX = gx;
-        latestGyroscopeY = gy;
-        latestGyroscopeZ = gz;
+        gx -= offsetGyroX;
+        gy -= offsetGyroY;
+        gz -= offsetGyroZ;
 
-        // Read temperature (°C) - library returns int16_t, convert
-        latestTemperature = static_cast<float>(bmi088.getTemperature()) / 100.0f; // Assuming library scale
+        // Apply software low-pass filter to gyro
+        latestGyroscopeX = lowPassFilter(latestGyroscopeX, gx, 0.8f);
+        latestGyroscopeY = lowPassFilter(latestGyroscopeY, gy, 0.8f);
+        latestGyroscopeZ = lowPassFilter(latestGyroscopeZ, gz, 0.8f);
+
+        // Read temperature (°C)
+        latestTemperature = static_cast<float>(bmi088.getTemperature()) / 100.0f;
 
         latestTimestampMilliseconds = millis();
 
-        // Accumulate for accel covariance
+        // Accumulate for covariance (using filtered values)
         sumAccelX += latestAccelerometerX;
         sumAccelY += latestAccelerometerY;
         sumAccelZ += latestAccelerometerZ;
@@ -66,7 +89,6 @@ public:
         sumAccelXZ += latestAccelerometerX * latestAccelerometerZ;
         sumAccelYZ += latestAccelerometerY * latestAccelerometerZ;
 
-        // Accumulate for gyro covariance
         sumGyroX += latestGyroscopeX;
         sumGyroY += latestGyroscopeY;
         sumGyroZ += latestGyroscopeZ;
@@ -168,6 +190,9 @@ private:
     float latestTemperature;
     unsigned long latestTimestampMilliseconds;
 
+    float offsetAccelX, offsetAccelY, offsetAccelZ; // Calibration offsets
+    float offsetGyroX, offsetGyroY, offsetGyroZ;
+
     // Accumulators for covariance
     float sumAccelX, sumAccelY, sumAccelZ;
     float sumAccelXX, sumAccelYY, sumAccelZZ;
@@ -180,6 +205,39 @@ private:
     // Covariance matrices (3x3, row-major)
     float accelCovMatrix[9];
     float gyroCovMatrix[9];
+
+    // Simple exponential moving average low-pass filter
+    float lowPassFilter(float prev, float curr, float alpha)
+    {
+        return prev * (1 - alpha) + curr * alpha;
+    }
+
+    // Calibrate offsets (call in begin(), assume sensor is still)
+    void calibrateOffsets()
+    {
+        offsetAccelX = offsetAccelY = offsetAccelZ = 0.0f;
+        offsetGyroX = offsetGyroY = offsetGyroZ = 0.0f;
+        const int calSamples = 100;
+        for (int i = 0; i < calSamples; i++)
+        {
+            float ax, ay, az, gx, gy, gz;
+            bmi088.getAcceleration(&ax, &ay, &az);
+            bmi088.getGyroscope(&gx, &gy, &gz);
+            offsetAccelX += ax;
+            offsetAccelY += ay;
+            offsetAccelZ += az;
+            offsetGyroX += gx;
+            offsetGyroY += gy;
+            offsetGyroZ += gz;
+            delay(10); // Short delay between samples
+        }
+        offsetAccelX /= calSamples;
+        offsetAccelY /= calSamples;
+        offsetAccelZ /= calSamples - 9.81f; // Subtract gravity from Z (assume Z up)
+        offsetGyroX /= calSamples;
+        offsetGyroY /= calSamples;
+        offsetGyroZ /= calSamples;
+    }
 };
 
 #endif // GROVE_BMI088_IMU_H
