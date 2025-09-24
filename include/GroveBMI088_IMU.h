@@ -6,14 +6,21 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-#include "BMI088.h" // Seeed Grove BMI088 library
+#include "BMI088.h"
 #include "IMUInterface.h"
+#include "IMUCommon.h"
 #include <string.h> // For memset
+
+// This header uses the Bolderflight BMI088 library API.
+// The library transforms sensor data into a right-handed coordinate system
+// with Z positive down and returns accel in m/s^2 and gyro in rad/s.
 
 class GroveBMI088_IMU : public IMUInterface
 {
+private:
+    Bmi088 *bmi088; // Pointer to Bmi088 instance (allocated in ctor)
 public:
-    GroveBMI088_IMU() : bmi088(BMI088_ACC_ALT_ADDRESS, BMI088_GYRO_ALT_ADDRESS), // Default addresses (accel 0x18, gyro 0x68)
+    GroveBMI088_IMU() : // Bolderflight BMI088 will be allocated in constructor body
                         latestAccelerometerX(0.0f), latestAccelerometerY(0.0f), latestAccelerometerZ(0.0f),
                         latestGyroscopeX(0.0f), latestGyroscopeY(0.0f), latestGyroscopeZ(0.0f),
                         latestTemperature(0.0f), latestTimestampMilliseconds(0),
@@ -21,7 +28,21 @@ public:
                         offsetGyroX(0.0f), offsetGyroY(0.0f), offsetGyroZ(0.0f),
                         sampleCount(0)
     {
-        resetCovarianceAccumulators();
+    // Allocate Bolderflight BMI088 instance with default addresses; we'll probe other pairs in begin() if needed
+    bmi088 = new Bmi088(Wire, 0x18, 0x68);
+
+        accelAccumulator.reset();
+        gyroAccumulator.reset();
+        memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
+        memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
+    }
+
+    ~GroveBMI088_IMU()
+    {
+        if (bmi088) {
+            delete bmi088;
+            bmi088 = nullptr;
+        }
     }
 
     bool begin() override
@@ -29,76 +50,98 @@ public:
         // Init I2C (use Wire; adjust if using Wire1 on RP2350)
         Wire.begin();
 
-        // Init BMI088 (handles both accel and gyro internally)
-        bmi088.initialize();
+        // Try to initialize with the default address pair. If that fails,
+        // probe other common address pairs used by Grove/boards (0x18/0x19 accel and 0x68/0x69 gyro variants).
+        const uint8_t accel_addrs[] = {0x18, 0x19};
+        const uint8_t gyro_addrs[] = {0x68, 0x69};
 
-        // Configure range (wider for less sensitivity; adjust based on application)
-        bmi088.setAccScaleRange(RANGE_24G);  // ±24g for accel
-        bmi088.setGyroScaleRange(RANGE_500); // ±500 dps for gyro
+        Serial.println("BMI088: Starting probe for I2C addresses...");
 
-        // Configure ODR (output data rate) for onboard low-pass filtering
-        bmi088.setAccOutputDataRate(ODR_100);        // 100 Hz ODR with ~40 Hz bandwidth
-        bmi088.setGyroOutputDataRate(ODR_100_BW_12); // 100 Hz ODR with 12 Hz bandwidth
+        bool init_ok = false;
+        for (size_t ai = 0; ai < sizeof(accel_addrs); ++ai) {
+            for (size_t gi = 0; gi < sizeof(gyro_addrs); ++gi) {
+                uint8_t a = accel_addrs[ai];
+                uint8_t g = gyro_addrs[gi];
+                Serial.print("BMI088: Trying accel=0x");
+                Serial.print(a, HEX);
+                Serial.print(" gyro=0x");
+                Serial.println(g, HEX);
 
-        // Perform calibration (average offsets over 100 samples while still)
+                // Re-create bmi088 instance for this address pair
+                delete bmi088;
+                bmi088 = new Bmi088(Wire, a, g);
+                int status = bmi088->begin();
+                if (status >= 0) {
+                    init_ok = true;
+                    Serial.print("BMI088: Found device at accel=0x");
+                    Serial.print(a, HEX);
+                    Serial.print(" gyro=0x");
+                    Serial.println(g, HEX);
+                    break;
+                }
+                // small delay before next probe
+                delay(10);
+            }
+            if (init_ok) break;
+        }
+
+        if (!init_ok) {
+            Serial.println("BMI088: No device detected on I2C with common address pairs.");
+            return false;
+        }
+
+        // Set ranges and ODR to sensible defaults using the enums defined in BMI088.h
+        bmi088->setRange(Bmi088::ACCEL_RANGE_24G, Bmi088::GYRO_RANGE_500DPS);
+        bmi088->setOdr(Bmi088::ODR_400HZ);
+
+        // Configure covariance accumulator defaults: rolling window and epsilon.
+        // These values are conservative starting points for ground robotics.
+        accelAccumulator.setWindowSize(200); // e.g. ~2s at 100Hz
+        gyroAccumulator.setWindowSize(200);
+        accelAccumulator.setVarianceEpsilon(1e-9f);
+        gyroAccumulator.setVarianceEpsilon(1e-9f);
+
+        // Calibrate offsets while device is still
+        Serial.println("BMI088: Calibrating offsets...");
         calibrateOffsets();
+        Serial.println("BMI088: Calibration complete.");
 
-        // Check connection
-        return bmi088.isConnection();
+        return true;
     }
 
     void readSensorData() override
     {
-        // Read accel (in m/s²)
-        float ax, ay, az;
-        bmi088.getAcceleration(&ax, &ay, &az);
-        ax -= offsetAccelX;
-        ay -= offsetAccelY;
-        az -= offsetAccelZ;
+        // Read synchronized sensor values using Bolderflight BMI088
+        bmi088->readSensor();
 
-        // Apply software low-pass filter (exponential moving average, alpha=0.8 for smoothing)
+        float ax = bmi088->getAccelX_mss();
+        float ay = bmi088->getAccelY_mss();
+        float az = bmi088->getAccelZ_mss();
+
+        // Apply offsets and smoothing
+        ax = ax - offsetAccelX;
+        ay = ay - offsetAccelY;
+        az = az - offsetAccelZ;
         latestAccelerometerX = lowPassFilter(latestAccelerometerX, ax, 0.8f);
         latestAccelerometerY = lowPassFilter(latestAccelerometerY, ay, 0.8f);
         latestAccelerometerZ = lowPassFilter(latestAccelerometerZ, az, 0.8f);
 
-        // Read gyro (in rad/s)
-        float gx, gy, gz;
-        bmi088.getGyroscope(&gx, &gy, &gz);
-        gx -= offsetGyroX;
-        gy -= offsetGyroY;
-        gz -= offsetGyroZ;
+        float gx = bmi088->getGyroX_rads();
+        float gy = bmi088->getGyroY_rads();
+        float gz = bmi088->getGyroZ_rads();
 
-        // Apply software low-pass filter to gyro
+        gx = gx - offsetGyroX;
+        gy = gy - offsetGyroY;
+        gz = gz - offsetGyroZ;
         latestGyroscopeX = lowPassFilter(latestGyroscopeX, gx, 0.8f);
         latestGyroscopeY = lowPassFilter(latestGyroscopeY, gy, 0.8f);
         latestGyroscopeZ = lowPassFilter(latestGyroscopeZ, gz, 0.8f);
 
-        // Read temperature (°C)
-        latestTemperature = static_cast<float>(bmi088.getTemperature()) / 100.0f;
-
+        latestTemperature = bmi088->getTemperature_C();
         latestTimestampMilliseconds = millis();
 
-        // Accumulate for covariance (using filtered values)
-        sumAccelX += latestAccelerometerX;
-        sumAccelY += latestAccelerometerY;
-        sumAccelZ += latestAccelerometerZ;
-        sumAccelXX += latestAccelerometerX * latestAccelerometerX;
-        sumAccelYY += latestAccelerometerY * latestAccelerometerY;
-        sumAccelZZ += latestAccelerometerZ * latestAccelerometerZ;
-        sumAccelXY += latestAccelerometerX * latestAccelerometerY;
-        sumAccelXZ += latestAccelerometerX * latestAccelerometerZ;
-        sumAccelYZ += latestAccelerometerY * latestAccelerometerZ;
-
-        sumGyroX += latestGyroscopeX;
-        sumGyroY += latestGyroscopeY;
-        sumGyroZ += latestGyroscopeZ;
-        sumGyroXX += latestGyroscopeX * latestGyroscopeX;
-        sumGyroYY += latestGyroscopeY * latestGyroscopeY;
-        sumGyroZZ += latestGyroscopeZ * latestGyroscopeZ;
-        sumGyroXY += latestGyroscopeX * latestGyroscopeY;
-        sumGyroXZ += latestGyroscopeX * latestGyroscopeZ;
-        sumGyroYZ += latestGyroscopeY * latestGyroscopeZ;
-
+        accelAccumulator.addSample(latestAccelerometerX, latestAccelerometerY, latestAccelerometerZ);
+        gyroAccumulator.addSample(latestGyroscopeX, latestGyroscopeY, latestGyroscopeZ);
         sampleCount++;
     }
 
@@ -118,45 +161,11 @@ public:
 
     void computeCovariances() override
     {
-        if (sampleCount < 2)
-        {
-            // Not enough samples; zero matrices
-            memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
-            memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
-            return;
-        }
-
-        // Accel means
-        float meanAccelX = sumAccelX / sampleCount;
-        float meanAccelY = sumAccelY / sampleCount;
-        float meanAccelZ = sumAccelZ / sampleCount;
-
-        // Accel covariances
-        accelCovMatrix[0] = (sumAccelXX / sampleCount) - (meanAccelX * meanAccelX); // Var(X)
-        accelCovMatrix[1] = (sumAccelXY / sampleCount) - (meanAccelX * meanAccelY); // Cov(X,Y)
-        accelCovMatrix[2] = (sumAccelXZ / sampleCount) - (meanAccelX * meanAccelZ); // Cov(X,Z)
-        accelCovMatrix[3] = accelCovMatrix[1];                                      // Cov(Y,X) = Cov(X,Y)
-        accelCovMatrix[4] = (sumAccelYY / sampleCount) - (meanAccelY * meanAccelY); // Var(Y)
-        accelCovMatrix[5] = (sumAccelYZ / sampleCount) - (meanAccelY * meanAccelZ); // Cov(Y,Z)
-        accelCovMatrix[6] = accelCovMatrix[2];                                      // Cov(Z,X) = Cov(X,Z)
-        accelCovMatrix[7] = accelCovMatrix[5];                                      // Cov(Z,Y) = Cov(Y,Z)
-        accelCovMatrix[8] = (sumAccelZZ / sampleCount) - (meanAccelZ * meanAccelZ); // Var(Z)
-
-        // Gyro means
-        float meanGyroX = sumGyroX / sampleCount;
-        float meanGyroY = sumGyroY / sampleCount;
-        float meanGyroZ = sumGyroZ / sampleCount;
-
-        // Gyro covariances
-        gyroCovMatrix[0] = (sumGyroXX / sampleCount) - (meanGyroX * meanGyroX); // Var(X)
-        gyroCovMatrix[1] = (sumGyroXY / sampleCount) - (meanGyroX * meanGyroY); // Cov(X,Y)
-        gyroCovMatrix[2] = (sumGyroXZ / sampleCount) - (meanGyroX * meanGyroZ); // Cov(X,Z)
-        gyroCovMatrix[3] = gyroCovMatrix[1];                                    // Cov(Y,X)
-        gyroCovMatrix[4] = (sumGyroYY / sampleCount) - (meanGyroY * meanGyroY); // Var(Y)
-        gyroCovMatrix[5] = (sumGyroYZ / sampleCount) - (meanGyroY * meanGyroZ); // Cov(Y,Z)
-        gyroCovMatrix[6] = gyroCovMatrix[2];                                    // Cov(Z,X)
-        gyroCovMatrix[7] = gyroCovMatrix[5];                                    // Cov(Z,Y)
-        gyroCovMatrix[8] = (sumGyroZZ / sampleCount) - (meanGyroZ * meanGyroZ); // Var(Z)
+        // Compute covariance matrices using the unbiased sample estimator
+        // (cov = Σ(x-mean)(y-mean) / (n-1)). The accumulator uses sum and
+        // cross-product accumulators to compute this efficiently.
+        accelAccumulator.computeCovMatrix(accelCovMatrix);
+        gyroAccumulator.computeCovMatrix(gyroCovMatrix);
     }
 
     float getAccelerometerCovariance() const override { return accelCovMatrix[0]; } // Example: return Var(X); update if needed
@@ -166,24 +175,21 @@ public:
     const float *getAccelCovMatrix() const override { return accelCovMatrix; }
     const float *getGyroCovMatrix() const override { return gyroCovMatrix; }
 
+    // BMI088 does not provide orientation/quaternion information.
+    bool hasOrientation() const override { return false; }
+    const float *getOrientationCovMatrix() const override { return nullptr; }
+
     unsigned long getTimestampMilliseconds() const override { return latestTimestampMilliseconds; }
 
     // Optional: Reset accumulators to prevent overflow in long runs
     void resetCovarianceAccumulators()
     {
-        sumAccelX = sumAccelY = sumAccelZ = 0.0f;
-        sumAccelXX = sumAccelYY = sumAccelZZ = 0.0f;
-        sumAccelXY = sumAccelXZ = sumAccelYZ = 0.0f;
-        sumGyroX = sumGyroY = sumGyroZ = 0.0f;
-        sumGyroXX = sumGyroYY = sumGyroZZ = 0.0f;
-        sumGyroXY = sumGyroXZ = sumGyroYZ = 0.0f;
+        accelAccumulator.reset();
+        gyroAccumulator.reset();
         sampleCount = 0;
         memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
         memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
     }
-
-private:
-    BMI088 bmi088; // Single instance for both accel and gyro
 
     float latestAccelerometerX, latestAccelerometerY, latestAccelerometerZ;
     float latestGyroscopeX, latestGyroscopeY, latestGyroscopeZ;
@@ -194,12 +200,8 @@ private:
     float offsetGyroX, offsetGyroY, offsetGyroZ;
 
     // Accumulators for covariance
-    float sumAccelX, sumAccelY, sumAccelZ;
-    float sumAccelXX, sumAccelYY, sumAccelZZ;
-    float sumAccelXY, sumAccelXZ, sumAccelYZ;
-    float sumGyroX, sumGyroY, sumGyroZ;
-    float sumGyroXX, sumGyroYY, sumGyroZZ;
-    float sumGyroXY, sumGyroXZ, sumGyroYZ;
+    CovarianceAccumulator accelAccumulator;
+    CovarianceAccumulator gyroAccumulator;
     int sampleCount;
 
     // Covariance matrices (3x3, row-major)
@@ -220,9 +222,15 @@ private:
         const int calSamples = 100;
         for (int i = 0; i < calSamples; i++)
         {
-            float ax, ay, az, gx, gy, gz;
-            bmi088.getAcceleration(&ax, &ay, &az);
-            bmi088.getGyroscope(&gx, &gy, &gz);
+            bmi088->readSensor();
+            float ax = bmi088->getAccelX_mss();
+            float ay = bmi088->getAccelY_mss();
+            float az = bmi088->getAccelZ_mss();
+
+            float gx = bmi088->getGyroX_rads();
+            float gy = bmi088->getGyroY_rads();
+            float gz = bmi088->getGyroZ_rads();
+
             offsetAccelX += ax;
             offsetAccelY += ay;
             offsetAccelZ += az;
@@ -233,7 +241,8 @@ private:
         }
         offsetAccelX /= calSamples;
         offsetAccelY /= calSamples;
-        offsetAccelZ /= calSamples - 9.81f; // Subtract gravity from Z (assume Z up)
+        // Subtract gravity from Z (assume Z up in mapped frame)
+        offsetAccelZ = (offsetAccelZ / calSamples) - 9.81f;
         offsetGyroX /= calSamples;
         offsetGyroY /= calSamples;
         offsetGyroZ /= calSamples;

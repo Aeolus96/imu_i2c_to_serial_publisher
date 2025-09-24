@@ -21,16 +21,38 @@ public:
         doc["header"]["frame_id"] = "imu_link";
 
         // Orientation (from game rotation vector)
+        // Only populate orientation fields if the IMU reports having orientation.
+        // Some sensors (e.g., raw gyro/accel-only) won't supply orientation.
         const auto &orient = doc["orientation"].to<JsonObject>();
-        orient["x"] = imu.getOrientationX();
-        orient["y"] = imu.getOrientationY();
-        orient["z"] = imu.getOrientationZ();
-        orient["w"] = imu.getOrientationW();
+        if (imu.hasOrientation()) {
+            orient["x"] = imu.getOrientationX();
+            orient["y"] = imu.getOrientationY();
+            orient["z"] = imu.getOrientationZ();
+            orient["w"] = imu.getOrientationW();
 
-        const auto &orientCov = doc["orientation_covariance"].to<JsonArray>();
-        orientCov.add(-1.0); // Unknown; BNO doesn't provide
-        for (int i = 1; i < 9; ++i)
-            orientCov.add(0.0);
+            // Orientation covariance: follow REP 145.
+            // - If the driver provides a 3x3 orientation covariance matrix, use it.
+            // - If the driver supports orientation but does not provide covariance,
+            //   populate with zeros (meaningfully low covariance not specified).
+            const auto &orientCov = doc["orientation_covariance"].to<JsonArray>();
+            const float *orientMatrix = imu.getOrientationCovMatrix();
+            if (orientMatrix) {
+                for (int i = 0; i < 9; ++i)
+                    orientCov.add(orientMatrix[i]);
+            } else {
+                // Known orientation but no covariance provided: set zeros per REP145
+                for (int i = 0; i < 9; ++i)
+                    orientCov.add(0.0);
+            }
+        } else {
+            // IMU doesn't provide orientation. Per REP 145 the orientation covariance
+            // should be set to [-1, 0, 0, 0, 0, 0, 0, 0, 0] to indicate orientation is
+            // unknown / not provided.
+            const auto &orientCov = doc["orientation_covariance"].to<JsonArray>();
+            orientCov.add(-1.0);
+            for (int i = 1; i < 9; ++i)
+                orientCov.add(0.0);
+        }
 
         // Linear acceleration
         const auto &linAccel = doc["linear_acceleration"].to<JsonObject>();
@@ -40,8 +62,16 @@ public:
 
         const auto &linCov = doc["linear_acceleration_covariance"].to<JsonArray>();
         const float *accelMatrix = imu.getAccelCovMatrix();
-        for (int i = 0; i < 9; ++i)
-            linCov.add(accelMatrix[i]);
+        // Protective clamp: ensure diagonal elements are non-negative and not NaN.
+        for (int i = 0; i < 9; ++i) {
+            float v = accelMatrix[i];
+            if (i == 0 || i == 4 || i == 8) {
+                if (!isfinite(v) || v < 0.0f) v = 0.0f;
+            } else {
+                if (!isfinite(v)) v = 0.0f;
+            }
+            linCov.add(v);
+        }
 
         // Angular velocity
         const auto &angVel = doc["angular_velocity"].to<JsonObject>();
@@ -51,8 +81,15 @@ public:
 
         const auto &angCov = doc["angular_velocity_covariance"].to<JsonArray>();
         const float *gyroMatrix = imu.getGyroCovMatrix();
-        for (int i = 0; i < 9; ++i)
-            angCov.add(gyroMatrix[i]);
+        for (int i = 0; i < 9; ++i) {
+            float v = gyroMatrix[i];
+            if (i == 0 || i == 4 || i == 8) {
+                if (!isfinite(v) || v < 0.0f) v = 0.0f;
+            } else {
+                if (!isfinite(v)) v = 0.0f;
+            }
+            angCov.add(v);
+        }
 
         String json;
         serializeJson(doc, json);

@@ -27,6 +27,13 @@ public:
     virtual float getOrientationY() const = 0; // Quaternion Y
     virtual float getOrientationZ() const = 0; // Quaternion Z
     virtual float getOrientationW() const = 0; // Quaternion W
+    // Return true if this IMU implementation provides a valid orientation (quaternion).
+    // Default: false so adding this method is non-breaking for existing drivers.
+    virtual bool hasOrientation() const { return false; }
+    // If the IMU can provide an orientation covariance matrix, return a pointer to
+    // a 9-element row-major float array. Return nullptr if not available. Default
+    // implementation returns nullptr to remain backward compatible.
+    virtual const float *getOrientationCovMatrix() const { return nullptr; }
     virtual unsigned long getTimestampMilliseconds() const = 0;
     virtual ~IMUInterface() {}
 };

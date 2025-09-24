@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <Adafruit_BNO08x.h> // Adafruit library for BNO085/BNO08x
 #include "IMUInterface.h"
+#include "IMUCommon.h"
 #include <string.h> // For memset
 
 class BNO085_IMU : public IMUInterface
@@ -18,7 +19,12 @@ public:
                    latestOrientationX(0.0f), latestOrientationY(0.0f), latestOrientationZ(0.0f), latestOrientationW(1.0f),
                    sampleCount(0)
     {
-        resetCovarianceAccumulators();
+        accelAccumulator.reset();
+        gyroAccumulator.reset();
+        orientAccumulator.reset();
+        memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
+        memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
+        memset(orientCovMatrix, 0, sizeof(orientCovMatrix));
     }
 
     bool begin() override
@@ -33,6 +39,14 @@ public:
         sensorInstance.enableReport(SH2_GAME_ROTATION_VECTOR); // For orientation quaternion (no mag, smooth)
         sensorInstance.enableReport(SH2_TEMPERATURE);
         delay(500); // Allow initial calibration/stabilization
+
+        // Configure covariance accumulator defaults
+        accelAccumulator.setWindowSize(200);
+        gyroAccumulator.setWindowSize(200);
+        orientAccumulator.setWindowSize(200);
+        accelAccumulator.setVarianceEpsilon(1e-9f);
+        gyroAccumulator.setVarianceEpsilon(1e-9f);
+        orientAccumulator.setVarianceEpsilon(1e-9f);
         return true;
     }
 
@@ -71,28 +85,11 @@ public:
 
         latestTimestampMilliseconds = millis();
 
-        // Accumulate for accel covariance
-        sumAccelX += latestAccelerometerX;
-        sumAccelY += latestAccelerometerY;
-        sumAccelZ += latestAccelerometerZ;
-        sumAccelXX += latestAccelerometerX * latestAccelerometerX;
-        sumAccelYY += latestAccelerometerY * latestAccelerometerY;
-        sumAccelZZ += latestAccelerometerZ * latestAccelerometerZ;
-        sumAccelXY += latestAccelerometerX * latestAccelerometerY;
-        sumAccelXZ += latestAccelerometerX * latestAccelerometerZ;
-        sumAccelYZ += latestAccelerometerY * latestAccelerometerZ;
-
-        // Accumulate for gyro covariance
-        sumGyroX += latestGyroscopeX;
-        sumGyroY += latestGyroscopeY;
-        sumGyroZ += latestGyroscopeZ;
-        sumGyroXX += latestGyroscopeX * latestGyroscopeX;
-        sumGyroYY += latestGyroscopeY * latestGyroscopeY;
-        sumGyroZZ += latestGyroscopeZ * latestGyroscopeZ;
-        sumGyroXY += latestGyroscopeX * latestGyroscopeY;
-        sumGyroXZ += latestGyroscopeX * latestGyroscopeZ;
-        sumGyroYZ += latestGyroscopeY * latestGyroscopeZ;
-
+        // Accumulate sensor and orientation samples
+        accelAccumulator.addSample(latestAccelerometerX, latestAccelerometerY, latestAccelerometerZ);
+        gyroAccumulator.addSample(latestGyroscopeX, latestGyroscopeY, latestGyroscopeZ);
+        // Track the vector part (i,j,k) of the quaternion for simple covariance
+        orientAccumulator.addSample(latestOrientationX, latestOrientationY, latestOrientationZ);
         sampleCount++;
     }
 
@@ -110,45 +107,15 @@ public:
 
     void computeCovariances() override
     {
-        if (sampleCount < 2)
-        {
-            // Not enough samples; zero matrices
-            memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
-            memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
-            return;
-        }
-
-        // Accel means
-        float meanAccelX = sumAccelX / sampleCount;
-        float meanAccelY = sumAccelY / sampleCount;
-        float meanAccelZ = sumAccelZ / sampleCount;
-
-        // Accel covariances
-        accelCovMatrix[0] = (sumAccelXX / sampleCount) - (meanAccelX * meanAccelX); // Var(X)
-        accelCovMatrix[1] = (sumAccelXY / sampleCount) - (meanAccelX * meanAccelY); // Cov(X,Y)
-        accelCovMatrix[2] = (sumAccelXZ / sampleCount) - (meanAccelX * meanAccelZ); // Cov(X,Z)
-        accelCovMatrix[3] = accelCovMatrix[1];                                      // Cov(Y,X) = Cov(X,Y)
-        accelCovMatrix[4] = (sumAccelYY / sampleCount) - (meanAccelY * meanAccelY); // Var(Y)
-        accelCovMatrix[5] = (sumAccelYZ / sampleCount) - (meanAccelY * meanAccelZ); // Cov(Y,Z)
-        accelCovMatrix[6] = accelCovMatrix[2];                                      // Cov(Z,X) = Cov(X,Z)
-        accelCovMatrix[7] = accelCovMatrix[5];                                      // Cov(Z,Y) = Cov(Y,Z)
-        accelCovMatrix[8] = (sumAccelZZ / sampleCount) - (meanAccelZ * meanAccelZ); // Var(Z)
-
-        // Gyro means
-        float meanGyroX = sumGyroX / sampleCount;
-        float meanGyroY = sumGyroY / sampleCount;
-        float meanGyroZ = sumGyroZ / sampleCount;
-
-        // Gyro covariances
-        gyroCovMatrix[0] = (sumGyroXX / sampleCount) - (meanGyroX * meanGyroX); // Var(X)
-        gyroCovMatrix[1] = (sumGyroXY / sampleCount) - (meanGyroX * meanGyroY); // Cov(X,Y)
-        gyroCovMatrix[2] = (sumGyroXZ / sampleCount) - (meanGyroX * meanGyroZ); // Cov(X,Z)
-        gyroCovMatrix[3] = gyroCovMatrix[1];                                    // Cov(Y,X)
-        gyroCovMatrix[4] = (sumGyroYY / sampleCount) - (meanGyroY * meanGyroY); // Var(Y)
-        gyroCovMatrix[5] = (sumGyroYZ / sampleCount) - (meanGyroY * meanGyroZ); // Cov(Y,Z)
-        gyroCovMatrix[6] = gyroCovMatrix[2];                                    // Cov(Z,X)
-        gyroCovMatrix[7] = gyroCovMatrix[5];                                    // Cov(Z,Y)
-        gyroCovMatrix[8] = (sumGyroZZ / sampleCount) - (meanGyroZ * meanGyroZ); // Var(Z)
+        // Compute covariance matrices using the unbiased sample estimator:
+        //   mean_x = (1/n) * Σ x_i
+        //   cov_xy = (1/(n-1)) * Σ (x_i - mean_x) (y_i - mean_y)
+        // Implementation uses sum and cross-product accumulators for numerical efficiency.
+        accelAccumulator.computeCovMatrix(accelCovMatrix);
+        gyroAccumulator.computeCovMatrix(gyroCovMatrix);
+        // Orientation covariance based on quaternion vector part (i,j,k). If there are
+        // insufficient samples orientCovMatrix will be zeroed by the accumulator.
+        orientAccumulator.computeCovMatrix(orientCovMatrix);
     }
 
     float getAccelerometerCovariance() const override { return accelCovMatrix[0]; } // Example: return Var(X); update if needed
@@ -157,21 +124,26 @@ public:
     // New getters for full matrices (used in JSON formatter)
     const float *getAccelCovMatrix() const override { return accelCovMatrix; }
     const float *getGyroCovMatrix() const override { return gyroCovMatrix; }
+    // Orientation is provided by this sensor (game rotation vector). Indicate support.
+    bool hasOrientation() const override { return true; }
+    // Provide a 3x3 orientation covariance matrix computed over the quaternion
+    // vector part (i,j,k). This is a pragmatic choice: many drivers do not provide
+    // a full orientation covariance; using the vector part gives some notion of
+    // variability while remaining simple.
+    const float *getOrientationCovMatrix() const override { return orientCovMatrix; }
 
     unsigned long getTimestampMilliseconds() const override { return latestTimestampMilliseconds; }
 
     // Optional: Reset accumulators to prevent overflow in long runs
     void resetCovarianceAccumulators()
     {
-        sumAccelX = sumAccelY = sumAccelZ = 0.0f;
-        sumAccelXX = sumAccelYY = sumAccelZZ = 0.0f;
-        sumAccelXY = sumAccelXZ = sumAccelYZ = 0.0f;
-        sumGyroX = sumGyroY = sumGyroZ = 0.0f;
-        sumGyroXX = sumGyroYY = sumGyroZZ = 0.0f;
-        sumGyroXY = sumGyroXZ = sumGyroYZ = 0.0f;
+        accelAccumulator.reset();
+        gyroAccumulator.reset();
+        orientAccumulator.reset();
         sampleCount = 0;
         memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
         memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
+        memset(orientCovMatrix, 0, sizeof(orientCovMatrix));
     }
 
 private:
@@ -184,18 +156,17 @@ private:
 
     float latestOrientationX, latestOrientationY, latestOrientationZ, latestOrientationW;
 
-    // Accumulators for covariance
-    float sumAccelX, sumAccelY, sumAccelZ;
-    float sumAccelXX, sumAccelYY, sumAccelZZ;
-    float sumAccelXY, sumAccelXZ, sumAccelYZ;
-    float sumGyroX, sumGyroY, sumGyroZ;
-    float sumGyroXX, sumGyroYY, sumGyroZZ;
-    float sumGyroXY, sumGyroXZ, sumGyroYZ;
+    // Accumulators for covariance (reuse common helper)
+    CovarianceAccumulator accelAccumulator;
+    CovarianceAccumulator gyroAccumulator;
+    // Track quaternion vector part for orientation covariance (i,j,k)
+    CovarianceAccumulator orientAccumulator;
     int sampleCount;
 
     // Covariance matrices (3x3, row-major)
     float accelCovMatrix[9];
     float gyroCovMatrix[9];
+    float orientCovMatrix[9];
 };
 
 #endif // BNO085_IMU_H
