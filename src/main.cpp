@@ -47,6 +47,5 @@ void loop()
 
     // Output to Serial
     Serial.println(imuJson);
-
-    delay(200); // Adjust rate
 }
+
