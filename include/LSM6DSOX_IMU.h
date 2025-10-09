@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 #include <Adafruit_LSM6DSOX.h> // Specific for LSM6DSOX
+#include <Wire.h>
 #include "IMUInterface.h"
 #include "IMUCommon.h"
 
@@ -25,14 +26,37 @@ public:
 
     bool begin() override
     {
+        Serial.println("LSM6DSOX: init -> calling begin_I2C()");
+
+        // Ensure Wire is started. On some boards users may need to initialize
+        // Wire with alternate pins; this default should work in most cases.
+        Wire.begin();
+
         bool ok = sensorInstance.begin_I2C(); // Init I2C
-        if (ok) {
+        if (!ok) {
+            Serial.println("LSM6DSOX: begin_I2C() returned false");
+            Serial.println("LSM6DSOX: Scanning I2C bus for devices...");
+
+            // Simple I2C scanner to list any responding addresses.
+            for (uint8_t addr = 1; addr < 127; ++addr)
+            {
+                Wire.beginTransmission(addr);
+                uint8_t err = Wire.endTransmission();
+                if (err == 0)
+                {
+                    Serial.print("  Found device at 0x");
+                    if (addr < 16) Serial.print('0');
+                    Serial.println(addr, HEX);
+                }
+            }
+        } else {
             // Configure covariance accumulator defaults
             accelAccumulator.setWindowSize(200);
             gyroAccumulator.setWindowSize(200);
             accelAccumulator.setVarianceEpsilon(1e-9f);
             gyroAccumulator.setVarianceEpsilon(1e-9f);
         }
+
         return ok;
     }
 
@@ -66,6 +90,17 @@ public:
     float getGyroscopeY() const override { return latestGyroscopeY; }
     float getGyroscopeZ() const override { return latestGyroscopeZ; }
     float getTemperature() const override { return latestTemperature; }
+
+    // Orientation not provided by LSM6DSOX (no magnetometer/quaternion).
+    // Provide default quaternion (identity) so this class satisfies the
+    // IMUInterface contract. Drivers that can supply orientation should
+    // override hasOrientation() to return true and provide values.
+    float getOrientationX() const override { return 0.0f; }
+    float getOrientationY() const override { return 0.0f; }
+    float getOrientationZ() const override { return 0.0f; }
+    float getOrientationW() const override { return 1.0f; }
+    bool hasOrientation() const override { return false; }
+    const float *getOrientationCovMatrix() const override { return nullptr; }
 
     void computeCovariances() override
     {

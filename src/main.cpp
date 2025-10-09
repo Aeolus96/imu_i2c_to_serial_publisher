@@ -6,14 +6,14 @@
 #include "IMUMessageFormatter.h"
 
 // SELECT THE IMU SENSOR BY INCLUDING THE APPROPRIATE HEADER AND INSTANTIATING IT:
-// #include "LSM6DSOX_IMU.h"
-// LSM6DSOX_IMU activeImuSensor;
+#include "LSM6DSOX_IMU.h"
+LSM6DSOX_IMU activeImuSensor;
 
 // #include "BNO085_IMU.h"
 // BNO085_IMU activeImuSensor;
 
-#include "GroveBMI088_IMU.h"
-GroveBMI088_IMU activeImuSensor;
+// #include "GroveBMI088_IMU.h"
+// GroveBMI088_IMU activeImuSensor;
 
 // Reference to active IMU (interface for modularity)
 IMUInterface &imu = activeImuSensor;
