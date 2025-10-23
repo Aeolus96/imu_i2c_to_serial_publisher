@@ -1,9 +1,15 @@
-// src/main.cpp (finalized for firmware-side verification)
-// XIAO RP2350 / ESP32-S3 IMU -> COBS+CRC binary telemetry at 100 Hz
-// Reuses your include/: BNO085_IMU.h, LSM6DSOX_IMU.h, GroveBMI088_IMU.h, IMUCommon.h
-// Sensor units: gyro rad/s, accel m/s^2; orientation quaternion if available.
-// Flags: bit0 orientation_valid (others reserved; host ignores).
-// Commands on USB CDC: 'T' = send one-shot synthetic test frame; 'C' = toggle CRC error injection; 'R' = reset covariances (if implemented).
+// src/main.cpp
+// XIAO RP2350 / ESP32-S3 IMU -> COBS+CRC16 binary telemetry at 100 Hz.
+// Packet: [0x31][seq u16][sensor_id u8][flags u8][t_ms u32]
+//         [quat w,x,y,z f32][gyro x,y,z f32][acc x,y,z f32]
+//         [diag_ori 3*f32][diag_gyro 3*f32][diag_acc 3*f32][crc16 u16] + COBS + 0x00.
+//
+// Changes:
+// - Read ax/ay/az and gyro into locals immediately after readSensorData()
+//   THEN call computeCovariances(); publish the locals so any driver-side
+//   filtering/cov updates cannot mutate the values being sent (fixes BMI088 2 g Z).
+// - ‘D’ command prints one-line accel dump in m/s^2 for face checks.
+// - Same schema, flags, and driver includes; no Z-only gravity tweak.
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -30,7 +36,6 @@ static inline uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc
     return crc;
 }
 
-// Correct COBS encoder: returns bytes written
 static size_t cobs_encode(const uint8_t *input, size_t length, uint8_t *output)
 {
     uint8_t *out_start = output;
@@ -75,11 +80,6 @@ static GroveBMI088_IMU imu_bmi;
 static BNO085_IMU imu_bno;
 static SensorId detected = SID_NONE;
 
-// Self-test controls
-static bool inject_crc = false;
-static const uint16_t inject_every = 100;
-static bool send_test_once = false;
-
 static bool begin_first_available()
 {
     if (imu_bno.begin())
@@ -112,11 +112,11 @@ static bool begin_first_available()
 #pragma pack(push, 1)
 struct ImuPacketV1
 {
-    uint8_t type;      // 0x31
-    uint16_t seq;      // incrementing
-    uint8_t sensor_id; // SensorId
-    uint8_t flags;     // bit0: orientation_valid
-    uint32_t t_ms;     // millis()
+    uint8_t type;
+    uint16_t seq;
+    uint8_t sensor_id;
+    uint8_t flags; // bit0: orientation_valid
+    uint32_t t_ms;
     float qw, qx, qy, qz;
     float gx, gy, gz; // rad/s
     float ax, ay, az; // m/s^2
@@ -127,21 +127,20 @@ struct ImuPacketV1
 };
 #pragma pack(pop)
 
+#if defined(__cplusplus) && (__cplusplus >= 201103L)
 static_assert(sizeof(ImuPacketV1) == (1 + 2 + 1 + 1 + 4 + 16 + 12 + 12 + 12 + 12 + 12 + 2), "Packet size mismatch");
+#endif
 
 static const uint32_t publish_hz = 100;
 static const uint32_t publish_dt_ms = 1000 / publish_hz;
 
-static inline float fclampnan(float v)
-{
-    if (!isfinite(v))
-        return 0.0f;
-    return v;
-}
+static bool inject_crc = false;
+static bool send_test_once = false;
 
-static void process_commands()
+static inline float fclampnan(float v) { return isfinite(v) ? v : 0.0f; }
+
+static void process_commands(float ax, float ay, float az)
 {
-    // Non-blocking read of up to a few bytes
     int safety = 16;
     while (Serial.available() > 0 && safety-- > 0)
     {
@@ -159,9 +158,16 @@ static void process_commands()
         }
         else if (c == 'R' || c == 'r')
         {
-            // Optional: reset covariance accumulators if your drivers expose it
-            // For compatibility, silently ignore if not present.
             Serial.println("CMD: reset covariances (if supported)");
+        }
+        else if (c == 'D' || c == 'd')
+        {
+            Serial.print("ACC mps2: ");
+            Serial.print(ax, 6);
+            Serial.print(", ");
+            Serial.print(ay, 6);
+            Serial.print(", ");
+            Serial.println(az, 6);
         }
     }
 }
@@ -183,119 +189,116 @@ void loop()
     const uint32_t now_ms = millis();
     if ((now_ms - last_ms) < publish_dt_ms)
     {
-        process_commands();
+        process_commands(0.0f, 0.0f, 0.0f);
         delay(1);
         return;
     }
     last_ms = now_ms;
-    process_commands();
 
-    // Read exactly once per publish tick
     if (!imu)
     {
         begin_first_available();
     }
-    else
+
+    // 1) Read one fresh sample
+    float raw_qw = 1.0f, raw_qx = 0.0f, raw_qy = 0.0f, raw_qz = 0.0f;
+    float raw_gx = 0.0f, raw_gy = 0.0f, raw_gz = 0.0f;
+    float raw_ax = 0.0f, raw_ay = 0.0f, raw_az = 0.0f;
+    bool has_ori = false;
+
+    if (imu)
     {
         imu->readSensorData();
+
+        // Snapshot values BEFORE computing covariances (critical for BMI088)
+        has_ori = imu->hasOrientation();
+        if (has_ori)
+        {
+            raw_qx = imu->getOrientationX();
+            raw_qy = imu->getOrientationY();
+            raw_qz = imu->getOrientationZ();
+            raw_qw = imu->getOrientationW();
+            float qn = sqrtf(raw_qw * raw_qw + raw_qx * raw_qx + raw_qy * raw_qy + raw_qz * raw_qz);
+            if (qn > 0.0f)
+            {
+                raw_qw /= qn;
+                raw_qx /= qn;
+                raw_qy /= qn;
+                raw_qz /= qn;
+            }
+        }
+        raw_gx = imu->getGyroscopeX();
+        raw_gy = imu->getGyroscopeY();
+        raw_gz = imu->getGyroscopeZ();
+        raw_ax = imu->getAccelerometerX();
+        raw_ay = imu->getAccelerometerY();
+        raw_az = imu->getAccelerometerZ();
+
+        // 2) Only now compute covariances (do not touch the snapshot)
+        imu->computeCovariances();
+
+        // Guard against NaNs
+        raw_qw = fclampnan(raw_qw);
+        raw_qx = fclampnan(raw_qx);
+        raw_qy = fclampnan(raw_qy);
+        raw_qz = fclampnan(raw_qz);
+        raw_gx = fclampnan(raw_gx);
+        raw_gy = fclampnan(raw_gy);
+        raw_gz = fclampnan(raw_gz);
+        raw_ax = fclampnan(raw_ax);
+        raw_ay = fclampnan(raw_ay);
+        raw_az = fclampnan(raw_az);
     }
 
-    // Prepare packet
+    process_commands(raw_ax, raw_ay, raw_az);
+
+    // Build packet
     ImuPacketV1 p{};
     p.type = PKT_IMU_V1;
     p.seq = seq++;
     p.sensor_id = (uint8_t)detected;
-    const bool has_ori = (imu && imu->hasOrientation());
     p.flags = has_ori ? 0x01 : 0x00;
     p.t_ms = now_ms;
 
-    // Synthetic test frame if requested
-    if (send_test_once)
+    p.qw = raw_qw;
+    p.qx = raw_qx;
+    p.qy = raw_qy;
+    p.qz = raw_qz;
+    p.gx = raw_gx;
+    p.gy = raw_gy;
+    p.gz = raw_gz;
+    p.ax = raw_ax;
+    p.ay = raw_ay;
+    p.az = raw_az;
+
+    const float *covG = imu ? imu->getGyroCovMatrix() : nullptr;
+    const float *covA = imu ? imu->getAccelCovMatrix() : nullptr;
+    const float *covO = (imu && has_ori) ? imu->getOrientationCovMatrix() : nullptr;
+
+    p.cov_gyr_x = covG ? fclampnan(covG[0]) : 0.0f;
+    p.cov_gyr_y = covG ? fclampnan(covG[4]) : 0.0f;
+    p.cov_gyr_z = covG ? fclampnan(covG[8]) : 0.0f;
+
+    p.cov_acc_x = covA ? fclampnan(covA[0]) : 0.0f;
+    p.cov_acc_y = covA ? fclampnan(covA[4]) : 0.0f;
+    p.cov_acc_z = covA ? fclampnan(covA[8]) : 0.0f;
+
+    if (covO)
     {
-        send_test_once = false;
-        p.qw = 1.0f;
-        p.qx = p.qy = p.qz = 0.0f;
-        p.gx = 0.01f;
-        p.gy = -0.02f;
-        p.gz = 0.0f;
-        p.ax = 0.0f;
-        p.ay = 0.0f;
-        p.az = 9.81f;
-        p.cov_ori_x = p.cov_ori_y = p.cov_ori_z = 1e-6f;
-        p.cov_gyr_x = p.cov_gyr_y = p.cov_gyr_z = 1e-5f;
-        p.cov_acc_x = p.cov_acc_y = p.cov_acc_z = 1e-4f;
-    }
-    else if (imu)
-    {
-        // Compute covariances after one sample so window aligns with publish cadence
-        imu->computeCovariances();
-
-        // Orientation
-        float qx = has_ori ? imu->getOrientationX() : 0.0f;
-        float qy = has_ori ? imu->getOrientationY() : 0.0f;
-        float qz = has_ori ? imu->getOrientationZ() : 0.0f;
-        float qw = has_ori ? imu->getOrientationW() : 1.0f;
-        // Normalize quaternion defensively
-        float qn = sqrtf(qw * qw + qx * qx + qy * qy + qz * qz);
-        if (qn > 0.0f)
-        {
-            qw /= qn;
-            qx /= qn;
-            qy /= qn;
-            qz /= qn;
-        }
-        p.qw = fclampnan(qw);
-        p.qx = fclampnan(qx);
-        p.qy = fclampnan(qy);
-        p.qz = fclampnan(qz);
-
-        // Gyro and accel with NaN guards
-        p.gx = fclampnan(imu->getGyroscopeX());
-        p.gy = fclampnan(imu->getGyroscopeY());
-        p.gz = fclampnan(imu->getGyroscopeZ());
-
-        p.ax = fclampnan(imu->getAccelerometerX());
-        p.ay = fclampnan(imu->getAccelerometerY());
-        p.az = fclampnan(imu->getAccelerometerZ());
-
-        // Diagonal variances from 3x3 row-major
-        const float *covG = imu->getGyroCovMatrix();
-        const float *covA = imu->getAccelCovMatrix();
-        const float *covO = has_ori ? imu->getOrientationCovMatrix() : nullptr;
-
-        p.cov_gyr_x = covG ? fclampnan(covG[0]) : 0.0f;
-        p.cov_gyr_y = covG ? fclampnan(covG[4]) : 0.0f;
-        p.cov_gyr_z = covG ? fclampnan(covG[8]) : 0.0f;
-
-        p.cov_acc_x = covA ? fclampnan(covA[0]) : 0.0f;
-        p.cov_acc_y = covA ? fclampnan(covA[4]) : 0.0f;
-        p.cov_acc_z = covA ? fclampnan(covA[8]) : 0.0f;
-
-        if (covO)
-        {
-            p.cov_ori_x = fclampnan(covO[0]);
-            p.cov_ori_y = fclampnan(covO[4]);
-            p.cov_ori_z = fclampnan(covO[8]);
-        }
-    }
-    else
-    {
-        // No IMU yet: keep line active for debugging
-        p.qw = 1.0f;
-        p.qx = p.qy = p.qz = 0.0f;
-        p.gx = p.gy = p.gz = 0.0f;
-        p.ax = p.ay = p.az = 0.0f;
+        p.cov_ori_x = fclampnan(covO[0]);
+        p.cov_ori_y = fclampnan(covO[4]);
+        p.cov_ori_z = fclampnan(covO[8]);
     }
 
-    // CRC and optional corruption for test
+    // CRC (optional injection for recovery tests)
     const size_t payload_len_wo_crc = sizeof(ImuPacketV1) - sizeof(uint16_t);
     p.crc = crc16_ccitt(reinterpret_cast<const uint8_t *>(&p), payload_len_wo_crc);
-    if (inject_crc && (p.seq % inject_every == 0))
+    if (inject_crc && (p.seq % 100 == 0))
     {
-        p.crc ^= 0xFFFF; // deliberate bad CRC for recovery tests
+        p.crc ^= 0xFFFF;
     }
 
-    // Encode and send
+    // COBS encode + delimiter
     uint8_t enc[256];
     const size_t enc_len = cobs_encode(reinterpret_cast<const uint8_t *>(&p), sizeof(ImuPacketV1), enc);
     Serial.write(enc, enc_len);

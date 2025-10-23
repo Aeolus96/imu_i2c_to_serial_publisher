@@ -84,7 +84,7 @@ def norm3(v):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM1")
+    ap.add_argument("--port", default="/dev/ttyACM0")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--window", type=int, default=200)
