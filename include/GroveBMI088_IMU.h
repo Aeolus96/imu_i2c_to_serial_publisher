@@ -1,6 +1,6 @@
 // include/GroveBMI088_IMU.h
-// Grove BMI088 IMU implementation (fixed: no gravity tweak on Z, no accel DC offsets).
-// Inherits from IMUInterface. Header-only to match your repo’s structure.
+// Grove BMI088 IMU implementation with explicit BMI088->ENU axis mapping.
+// Library frame per comment: right-handed, Z positive DOWN; we map to ENU: X fwd, Y left, Z up.
 
 #ifndef GROVE_BMI088_IMU_H
 #define GROVE_BMI088_IMU_H
@@ -13,13 +13,12 @@
 #include <string.h>
 
 // Bolderflight BMI088 returns accel in m/s^2 and gyro in rad/s; library uses a right-handed frame with Z positive down.
-// This driver passes accelerations through in SI units with minimal filtering and does NOT inject/remove gravity on any axis.
-// Gyro DC bias is estimated at boot and subtracted; accelerometer DC offsets are NOT applied (kept at zero) to preserve gravity in Imu data.
-
+// We expose a simple axis-sign mapping so the firmware publishes ENU by default (X=fwd, Y=left, Z=up).
 class GroveBMI088_IMU : public IMUInterface
 {
 private:
-    Bmi088 *bmi088; // allocated dynamically so address probing is possible
+    Bmi088 *bmi088; // dynamically allocated so we can probe addresses
+
 public:
     GroveBMI088_IMU()
         : latestAccelerometerX(0.0f), latestAccelerometerY(0.0f), latestAccelerometerZ(0.0f),
@@ -27,7 +26,10 @@ public:
           latestTemperature(0.0f), latestTimestampMilliseconds(0),
           offsetAccelX(0.0f), offsetAccelY(0.0f), offsetAccelZ(0.0f),
           offsetGyroX(0.0f), offsetGyroY(0.0f), offsetGyroZ(0.0f),
-          sampleCount(0)
+          sampleCount(0),
+          // BMI088 (Bolderflight) is Z-down, Y-right; ENU needs Z-up, Y-left
+          signAx(1.0f), signAy(-1.0f), signAz(-1.0f),
+          signGx(1.0f), signGy(-1.0f), signGz(-1.0f)
     {
         bmi088 = new Bmi088(Wire, 0x18, 0x68);
         accelAccumulator.reset();
@@ -43,6 +45,20 @@ public:
             delete bmi088;
             bmi088 = nullptr;
         }
+    }
+
+    // Optional: allow changing signs at runtime (e.g., via a simple serial command later)
+    void setAccelSigns(float sx, float sy, float sz)
+    {
+        signAx = (sx >= 0 ? 1.0f : -1.0f);
+        signAy = (sy >= 0 ? 1.0f : -1.0f);
+        signAz = (sz >= 0 ? 1.0f : -1.0f);
+    }
+    void setGyroSigns(float sx, float sy, float sz)
+    {
+        signGx = (sx >= 0 ? 1.0f : -1.0f);
+        signGy = (sy >= 0 ? 1.0f : -1.0f);
+        signGz = (sz >= 0 ? 1.0f : -1.0f);
     }
 
     bool begin() override
@@ -99,7 +115,7 @@ public:
         accelAccumulator.setVarianceEpsilon(1e-9f);
         gyroAccumulator.setVarianceEpsilon(1e-9f);
 
-        // Calibrate only gyro DC bias; keep accelerometer DC offsets at zero (do not touch gravity)
+        // Calibrate only gyro DC bias; keep accelerometer DC offsets at zero (preserve gravity)
         Serial.println("BMI088: Calibrating gyro offsets...");
         calibrateGyroOffsets();
         Serial.println("BMI088: Gyro calibration complete.");
@@ -108,6 +124,9 @@ public:
         offsetAccelX = 0.0f;
         offsetAccelY = 0.0f;
         offsetAccelZ = 0.0f;
+
+        // Defaults already map BMI088 (Z-down/Y-right) -> ENU (Z-up/Y-left)
+        // signAx=+1, signAy=-1, signAz=-1; signGx=+1, signGy=-1, signGz=-1
 
         return true;
     }
@@ -121,8 +140,12 @@ public:
         float ay = bmi088->getAccelY_mss();
         float az = bmi088->getAccelZ_mss();
 
-        // DO NOT subtract accel DC offsets (preserve gravity in Imu)
-        // If you later want factory bias removal, implement a multi-face calibration – not a single-pose gravity tweak.
+        // Apply sign mapping to ENU (X fwd, Y left, Z up)
+        ax = signAx * ax;
+        ay = signAy * ay;
+        az = signAz * az;
+
+        // Keep gravity; do NOT subtract accel DC offsets in firmware
         latestAccelerometerX = lowPassFilter(latestAccelerometerX, ax, 0.8f);
         latestAccelerometerY = lowPassFilter(latestAccelerometerY, ay, 0.8f);
         latestAccelerometerZ = lowPassFilter(latestAccelerometerZ, az, 0.8f);
@@ -131,10 +154,11 @@ public:
         float gy = bmi088->getGyroY_rads();
         float gz = bmi088->getGyroZ_rads();
 
-        // Subtract gyro DC bias only
-        gx -= offsetGyroX;
-        gy -= offsetGyroY;
-        gz -= offsetGyroZ;
+        // Subtract gyro DC bias only, then apply sign mapping to ENU
+        gx = signGx * (gx - offsetGyroX);
+        gy = signGy * (gy - offsetGyroY);
+        gz = signGz * (gz - offsetGyroZ);
+
         latestGyroscopeX = lowPassFilter(latestGyroscopeX, gx, 0.8f);
         latestGyroscopeY = lowPassFilter(latestGyroscopeY, gy, 0.8f);
         latestGyroscopeZ = lowPassFilter(latestGyroscopeZ, gz, 0.8f);
@@ -187,7 +211,7 @@ public:
         memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
     }
 
-    // Public for transparency (unchanged API)
+    // Public for transparency
     float latestAccelerometerX, latestAccelerometerY, latestAccelerometerZ;
     float latestGyroscopeX, latestGyroscopeY, latestGyroscopeZ;
     float latestTemperature;
@@ -209,7 +233,6 @@ private:
         return prev * (1.0f - alpha) + curr * alpha;
     }
 
-    // Calibrate gyro only; estimate DC bias over short still period
     void calibrateGyroOffsets()
     {
         offsetGyroX = offsetGyroY = offsetGyroZ = 0.0f;
@@ -231,6 +254,10 @@ private:
         offsetAccelY = 0.0f;
         offsetAccelZ = 0.0f;
     }
+
+    // Axis sign mapping (BMI088 -> ENU)
+    float signAx, signAy, signAz;
+    float signGx, signGy, signGz;
 };
 
 #endif // GROVE_BMI088_IMU_H
