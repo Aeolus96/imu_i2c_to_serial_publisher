@@ -10,6 +10,7 @@
 #include "BMI088.h"
 #include "IMUInterface.h"
 #include "IMUCommon.h"
+#include "StaticCovariances.h"
 #include <string.h>
 
 // Bolderflight BMI088 returns accel in m/s^2 and gyro in rad/s; library uses a right-handed frame with Z positive down.
@@ -29,13 +30,17 @@ public:
           sampleCount(0),
           // BMI088 (Bolderflight) is Z-down, Y-right; ENU needs Z-up, Y-left
           signAx(1.0f), signAy(-1.0f), signAz(-1.0f),
-          signGx(1.0f), signGy(-1.0f), signGz(-1.0f)
+          signGx(1.0f), signGy(-1.0f), signGz(-1.0f),
+          staticCovarianceMode(false)
     {
         bmi088 = new Bmi088(Wire, 0x18, 0x68);
         accelAccumulator.reset();
         gyroAccumulator.reset();
         memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
         memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
+        // Initialize static covariance matrices
+        memcpy(accelCovMatrix, BMI088_StaticCovariances::ACCEL_COV, sizeof(accelCovMatrix));
+        memcpy(gyroCovMatrix, BMI088_StaticCovariances::GYRO_COV, sizeof(gyroCovMatrix));
     }
 
     ~GroveBMI088_IMU()
@@ -190,8 +195,12 @@ public:
 
     void computeCovariances() override
     {
-        accelAccumulator.computeCovMatrix(accelCovMatrix);
-        gyroAccumulator.computeCovMatrix(gyroCovMatrix);
+        if (!staticCovarianceMode)
+        {
+            accelAccumulator.computeCovMatrix(accelCovMatrix);
+            gyroAccumulator.computeCovMatrix(gyroCovMatrix);
+        }
+        // If staticCovarianceMode is true, keep the static values already in the matrices
     }
 
     float getAccelerometerCovariance() const override { return accelCovMatrix[0]; }
@@ -209,6 +218,26 @@ public:
         sampleCount = 0;
         memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
         memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
+        // Re-initialize static values
+        memcpy(accelCovMatrix, BMI088_StaticCovariances::ACCEL_COV, sizeof(accelCovMatrix));
+        memcpy(gyroCovMatrix, BMI088_StaticCovariances::GYRO_COV, sizeof(gyroCovMatrix));
+    }
+
+    // Static covariance mode control
+    void setStaticCovarianceMode(bool enabled) override
+    {
+        staticCovarianceMode = enabled;
+        if (enabled)
+        {
+            // Switch to static values
+            memcpy(accelCovMatrix, BMI088_StaticCovariances::ACCEL_COV, sizeof(accelCovMatrix));
+            memcpy(gyroCovMatrix, BMI088_StaticCovariances::GYRO_COV, sizeof(gyroCovMatrix));
+        }
+    }
+
+    bool getStaticCovarianceMode() const override
+    {
+        return staticCovarianceMode;
     }
 
     // Public for transparency
@@ -258,6 +287,9 @@ private:
     // Axis sign mapping (BMI088 -> ENU)
     float signAx, signAy, signAz;
     float signGx, signGy, signGz;
+
+    // Static covariance mode flag
+    bool staticCovarianceMode;
 };
 
 #endif // GROVE_BMI088_IMU_H

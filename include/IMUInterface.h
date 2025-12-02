@@ -35,6 +35,13 @@ public:
     // implementation returns nullptr to remain backward compatible.
     virtual const float *getOrientationCovMatrix() const { return nullptr; }
     virtual unsigned long getTimestampMilliseconds() const = 0;
+
+    // Static covariance mode: if enabled, use fixed datasheet-based values instead of
+    // computing covariances from sample statistics. Useful for robot_localization.
+    // Default: false (use computed covariances)
+    virtual void setStaticCovarianceMode(bool enabled) { (void)enabled; }
+    virtual bool getStaticCovarianceMode() const { return false; }
+
     virtual ~IMUInterface() {}
 };
 

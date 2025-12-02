@@ -137,6 +137,9 @@ static const uint32_t publish_dt_ms = 1000 / publish_hz;
 static bool inject_crc = false;
 static bool send_test_once = false;
 
+// Set to true to use static (datasheet-derived) covariance values instead of computed ones
+static bool USE_STATIC_COVARIANCE = true;
+
 static inline float fclampnan(float v) { return isfinite(v) ? v : 0.0f; }
 
 static void process_commands(float ax, float ay, float az)
@@ -179,6 +182,13 @@ void setup()
     Serial.println("IMU binary v1 ready (COBS+CRC16), 115200 baud");
     Wire.begin();
     begin_first_available();
+
+    // Apply static covariance mode if enabled
+    if (imu && USE_STATIC_COVARIANCE)
+    {
+        imu->setStaticCovarianceMode(true);
+        Serial.println("Static covariance mode: ENABLED");
+    }
 }
 
 void loop()

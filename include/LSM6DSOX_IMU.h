@@ -9,6 +9,8 @@
 #include <Wire.h>
 #include "IMUInterface.h"
 #include "IMUCommon.h"
+#include "StaticCovariances.h"
+#include <string.h>
 
 class LSM6DSOX_IMU : public IMUInterface
 {
@@ -16,12 +18,15 @@ public:
     LSM6DSOX_IMU() : latestAccelerometerX(0.0), latestAccelerometerY(0.0), latestAccelerometerZ(0.0),
                      latestGyroscopeX(0.0), latestGyroscopeY(0.0), latestGyroscopeZ(0.0),
                      latestTemperature(0.0), latestTimestampMilliseconds(0),
-                     sampleCount(0)
+                     sampleCount(0), staticCovarianceMode(false)
     {
         accelAccumulator.reset();
         gyroAccumulator.reset();
         memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
         memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
+        // Initialize static covariance matrices
+        memcpy(accelCovMatrix, LSM6DSOX_StaticCovariances::ACCEL_COV, sizeof(accelCovMatrix));
+        memcpy(gyroCovMatrix, LSM6DSOX_StaticCovariances::GYRO_COV, sizeof(gyroCovMatrix));
     }
 
     bool begin() override
@@ -33,7 +38,8 @@ public:
         Wire.begin();
 
         bool ok = sensorInstance.begin_I2C(); // Init I2C
-        if (!ok) {
+        if (!ok)
+        {
             Serial.println("LSM6DSOX: begin_I2C() returned false");
             Serial.println("LSM6DSOX: Scanning I2C bus for devices...");
 
@@ -45,11 +51,14 @@ public:
                 if (err == 0)
                 {
                     Serial.print("  Found device at 0x");
-                    if (addr < 16) Serial.print('0');
+                    if (addr < 16)
+                        Serial.print('0');
                     Serial.println(addr, HEX);
                 }
             }
-        } else {
+        }
+        else
+        {
             // Configure covariance accumulator defaults
             accelAccumulator.setWindowSize(200);
             gyroAccumulator.setWindowSize(200);
@@ -104,11 +113,15 @@ public:
 
     void computeCovariances() override
     {
-        // Compute covariance matrices using the unbiased sample estimator
-        // (cov = Σ(x-mean)(y-mean) / (n-1)). The accumulator uses sum and
-        // cross-product accumulators to compute this efficiently.
-        accelAccumulator.computeCovMatrix(accelCovMatrix);
-        gyroAccumulator.computeCovMatrix(gyroCovMatrix);
+        if (!staticCovarianceMode)
+        {
+            // Compute covariance matrices using the unbiased sample estimator
+            // (cov = Σ(x-mean)(y-mean) / (n-1)). The accumulator uses sum and
+            // cross-product accumulators to compute this efficiently.
+            accelAccumulator.computeCovMatrix(accelCovMatrix);
+            gyroAccumulator.computeCovMatrix(gyroCovMatrix);
+        }
+        // If staticCovarianceMode is true, keep the static values already in the matrices
     }
 
     float getAccelerometerCovariance() const override { return accelCovMatrix[0]; } // Example: return Var(X); update if needed
@@ -128,6 +141,26 @@ public:
         sampleCount = 0;
         memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
         memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
+        // Re-initialize static values
+        memcpy(accelCovMatrix, LSM6DSOX_StaticCovariances::ACCEL_COV, sizeof(accelCovMatrix));
+        memcpy(gyroCovMatrix, LSM6DSOX_StaticCovariances::GYRO_COV, sizeof(gyroCovMatrix));
+    }
+
+    // Static covariance mode control
+    void setStaticCovarianceMode(bool enabled) override
+    {
+        staticCovarianceMode = enabled;
+        if (enabled)
+        {
+            // Switch to static values
+            memcpy(accelCovMatrix, LSM6DSOX_StaticCovariances::ACCEL_COV, sizeof(accelCovMatrix));
+            memcpy(gyroCovMatrix, LSM6DSOX_StaticCovariances::GYRO_COV, sizeof(gyroCovMatrix));
+        }
+    }
+
+    bool getStaticCovarianceMode() const override
+    {
+        return staticCovarianceMode;
     }
 
 private:
@@ -147,6 +180,9 @@ private:
     // Covariance matrices (3x3, row-major)
     float accelCovMatrix[9];
     float gyroCovMatrix[9];
+
+    // Static covariance mode flag
+    bool staticCovarianceMode;
 };
 
 #endif // LSM6DSOX_IMU_H

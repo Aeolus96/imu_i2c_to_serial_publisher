@@ -8,6 +8,7 @@
 #include <Adafruit_BNO08x.h> // Adafruit library for BNO085/BNO08x
 #include "IMUInterface.h"
 #include "IMUCommon.h"
+#include "StaticCovariances.h"
 #include <string.h> // For memset
 
 class BNO085_IMU : public IMUInterface
@@ -17,7 +18,7 @@ public:
                    latestGyroscopeX(0.0f), latestGyroscopeY(0.0f), latestGyroscopeZ(0.0f),
                    latestTemperature(0.0f), latestTimestampMilliseconds(0),
                    latestOrientationX(0.0f), latestOrientationY(0.0f), latestOrientationZ(0.0f), latestOrientationW(1.0f),
-                   sampleCount(0)
+                   sampleCount(0), staticCovarianceMode(false)
     {
         accelAccumulator.reset();
         gyroAccumulator.reset();
@@ -25,6 +26,10 @@ public:
         memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
         memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
         memset(orientCovMatrix, 0, sizeof(orientCovMatrix));
+        // Initialize static covariance matrices
+        memcpy(accelCovMatrix, BNO085_StaticCovariances::ACCEL_COV, sizeof(accelCovMatrix));
+        memcpy(gyroCovMatrix, BNO085_StaticCovariances::GYRO_COV, sizeof(gyroCovMatrix));
+        memcpy(orientCovMatrix, BNO085_StaticCovariances::ORIENT_COV, sizeof(orientCovMatrix));
     }
 
     bool begin() override
@@ -107,15 +112,19 @@ public:
 
     void computeCovariances() override
     {
-        // Compute covariance matrices using the unbiased sample estimator:
-        //   mean_x = (1/n) * Σ x_i
-        //   cov_xy = (1/(n-1)) * Σ (x_i - mean_x) (y_i - mean_y)
-        // Implementation uses sum and cross-product accumulators for numerical efficiency.
-        accelAccumulator.computeCovMatrix(accelCovMatrix);
-        gyroAccumulator.computeCovMatrix(gyroCovMatrix);
-        // Orientation covariance based on quaternion vector part (i,j,k). If there are
-        // insufficient samples orientCovMatrix will be zeroed by the accumulator.
-        orientAccumulator.computeCovMatrix(orientCovMatrix);
+        if (!staticCovarianceMode)
+        {
+            // Compute covariance matrices using the unbiased sample estimator:
+            //   mean_x = (1/n) * Σ x_i
+            //   cov_xy = (1/(n-1)) * Σ (x_i - mean_x) (y_i - mean_y)
+            // Implementation uses sum and cross-product accumulators for numerical efficiency.
+            accelAccumulator.computeCovMatrix(accelCovMatrix);
+            gyroAccumulator.computeCovMatrix(gyroCovMatrix);
+            // Orientation covariance based on quaternion vector part (i,j,k). If there are
+            // insufficient samples orientCovMatrix will be zeroed by the accumulator.
+            orientAccumulator.computeCovMatrix(orientCovMatrix);
+        }
+        // If staticCovarianceMode is true, keep the static values already in the matrices
     }
 
     float getAccelerometerCovariance() const override { return accelCovMatrix[0]; } // Example: return Var(X); update if needed
@@ -144,6 +153,28 @@ public:
         memset(accelCovMatrix, 0, sizeof(accelCovMatrix));
         memset(gyroCovMatrix, 0, sizeof(gyroCovMatrix));
         memset(orientCovMatrix, 0, sizeof(orientCovMatrix));
+        // Re-initialize static values
+        memcpy(accelCovMatrix, BNO085_StaticCovariances::ACCEL_COV, sizeof(accelCovMatrix));
+        memcpy(gyroCovMatrix, BNO085_StaticCovariances::GYRO_COV, sizeof(gyroCovMatrix));
+        memcpy(orientCovMatrix, BNO085_StaticCovariances::ORIENT_COV, sizeof(orientCovMatrix));
+    }
+
+    // Static covariance mode control
+    void setStaticCovarianceMode(bool enabled) override
+    {
+        staticCovarianceMode = enabled;
+        if (enabled)
+        {
+            // Switch to static values
+            memcpy(accelCovMatrix, BNO085_StaticCovariances::ACCEL_COV, sizeof(accelCovMatrix));
+            memcpy(gyroCovMatrix, BNO085_StaticCovariances::GYRO_COV, sizeof(gyroCovMatrix));
+            memcpy(orientCovMatrix, BNO085_StaticCovariances::ORIENT_COV, sizeof(orientCovMatrix));
+        }
+    }
+
+    bool getStaticCovarianceMode() const override
+    {
+        return staticCovarianceMode;
     }
 
 private:
@@ -167,6 +198,9 @@ private:
     float accelCovMatrix[9];
     float gyroCovMatrix[9];
     float orientCovMatrix[9];
+
+    // Static covariance mode flag
+    bool staticCovarianceMode;
 };
 
 #endif // BNO085_IMU_H
