@@ -92,6 +92,7 @@ def main():
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--trigger_test", action="store_true", help="Send 'T' to request one-shot synthetic frame")
     ap.add_argument("--toggle_crc", action="store_true", help="Toggle firmware CRC injection with 'C'")
+    ap.add_argument("--skip_cov_check", action="store_true", help="Skip covariance validation (use when static covariances are enabled)")
     args = ap.parse_args()
 
     ser = serial.Serial(args.port, args.baud, timeout=0.2)
@@ -120,7 +121,6 @@ def main():
     rate_jitter_bad = 0
 
     start = time.time()
-    last_ok_time = start
 
     while time.time() - start < args.seconds:
         raw = ser.read_until(b"\x00")
@@ -179,14 +179,15 @@ def main():
                 # Variance agreement
                 vg = var_diag(list(gyro_win))
                 va = var_diag(list(acc_win))
-                for comp, tx in zip(vg, parsed["cov_g"]):
-                    ratio = max(1e-12, comp) / max(1e-12, tx)
-                    if ratio < 1 / args.tol_ratio or ratio > args.tol_ratio:
-                        cov_warn += 1
-                for comp, tx in zip(va, parsed["cov_a"]):
-                    ratio = max(1e-12, comp) / max(1e-12, tx)
-                    if ratio < 1 / args.tol_ratio or ratio > args.tol_ratio:
-                        cov_warn += 1
+                if not args.skip_cov_check:
+                    for comp, tx in zip(vg, parsed["cov_g"]):
+                        ratio = max(1e-12, comp) / max(1e-12, tx)
+                        if ratio < 1 / args.tol_ratio or ratio > args.tol_ratio:
+                            cov_warn += 1
+                    for comp, tx in zip(va, parsed["cov_a"]):
+                        ratio = max(1e-12, comp) / max(1e-12, tx)
+                        if ratio < 1 / args.tol_ratio or ratio > args.tol_ratio:
+                            cov_warn += 1
             # Rate jitter check from device timestamps
             dt = (t_win[-1] - t_win[0]) / max(1, (len(t_win) - 1))
             if not (8 <= dt <= 12):  # ms, expect ~10 ms
@@ -205,7 +206,10 @@ def main():
     ok = drops == 0 and bad_crc == 0 and bad_len == 0 and wrong_type == 0
     ok = ok and (quat_bad == 0)  # ignore if orientation not provided
     ok = ok and (grav_bad == 0) and (gyro_bias_bad == 0)
-    ok = ok and (cov_warn == 0) and (rate > 90.0)
+    if args.skip_cov_check:
+        ok = ok and (rate > 90.0)
+    else:
+        ok = ok and (cov_warn == 0) and (rate > 90.0)
 
     exit(0 if ok else 2)
 
